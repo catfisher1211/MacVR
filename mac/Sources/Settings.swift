@@ -26,7 +26,7 @@ final class Settings: ObservableObject {
                      Item(key: "update_channel", label: "Update Channel", options: ["Public", "Beta"], def: "Public", info: "Beta gets new features first.")]),
         ("General", [Item(key: "render_scale", label: "Render Resolution", options: ["50%", "75%", "100%", "125%", "150%"], def: "100%",
                           info: "Higher is sharper, lower is smoother."),
-                     Item(key: "refresh_rate", label: "Headset Refresh Rate", options: ["72", "80", "90"], def: "72", info: ""),
+                     Item(key: "refresh_rate", label: "Headset Refresh Rate", options: ["72", "80", "90", "120"], def: "72", info: ""),
                      Item(key: "wifi_play", label: "Wi-Fi Play", options: offOn, def: "On",
                           info: "Pair once over USB, then play without the cable.")]),
         ("Play Area", [Item(key: "home_style", label: "3D Home", options: ["Room 1107", "Kleeblatt"], def: "Room 1107", info: ""),

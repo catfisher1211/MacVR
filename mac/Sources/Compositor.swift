@@ -1548,7 +1548,7 @@ final class Compositor {
         }
         updateTorsoMesh()
         // Copy live skinned geometry; reflect world poses, preserving each hand's full rig.
-        for i in handModels.indices {
+        for i in handModels.indices where !avatarReflection.isHidden {
             reflectedHands[i].renderingOrder = 5
             reflectedHands[i].geometry = handModels[i]?.node.geometry.map { mirrorGeometry($0, head: head) }
             reflectedHands[i].simdTransform = handModels[i]?.node.simdWorldTransform ?? matrix_identity_float4x4
@@ -1557,7 +1557,7 @@ final class Compositor {
         // Keep one reflected body, updated as options change.
         if avatarReflection.childNode(withName: "Reflected torso", recursively: false) == nil { let clone = avatarBody.clone(); clone.name = "Reflected torso"; avatarReflection.addChildNode(clone) }
         let body = avatarReflection.childNode(withName: "Reflected torso", recursively: false)!; body.simdTransform = avatarBody.simdTransform; body.isHidden = avatarBody.isHidden
-        for (n, original) in zip(body.childNodes, avatarBody.childNodes) {
+        for (n, original) in zip(body.childNodes, avatarBody.childNodes) where !avatarReflection.isHidden {
             n.renderingOrder = 5
             if let geometry = original.geometry { n.geometry = mirrorGeometry(geometry, head: head) }
         }
@@ -1760,7 +1760,11 @@ final class Compositor {
 
     func render(_ t: VR4Tracking, eyeW: Int, eyeH: Int) -> CVPixelBuffer? {
         guard let pb = pixelBuffer(eyeW * 2, eyeH), let color = texture(pb, .bgra8Unorm_srgb) else { return nil }
-        let k = downsample == nil ? 1 : Compositor.ss, W = eyeW * 2 * k, H = eyeH * k
+        // At near-native Quest 3 resolution, another 2x in each dimension
+        // renders 33 million pixels per frame and consumes the streaming budget.
+        // Retain supersampling for smaller streams, render large streams natively.
+        let k = downsample == nil || min(eyeW, eyeH) >= 1792 ? 1 : Compositor.ss
+        let W = eyeW * 2 * k, H = eyeH * k
         if depth?.width != W || depth?.height != H {
             let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .depth32Float, width: W, height: H, mipmapped: false)
             d.usage = .renderTarget; d.storageMode = .private

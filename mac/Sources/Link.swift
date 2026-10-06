@@ -20,7 +20,10 @@ final class Link {
     var wired: Bool { Link.isLoopback(peer) }
     private var conn: NWConnection?
     private var inFlight = 0
-    private let q = DispatchQueue(label: "vr4.link")
+    private var audioInFlight = 0
+    private var audioPackets: [Data] = [], otherPackets: [Data] = []
+    private var sending = false
+    private let q = DispatchQueue(label: "vr4.link", qos: .userInteractive)
     private var listener: NWListener?
     private let usbQueue = DispatchQueue(label: "vr4.usb", qos: .utility)
     private var usbPending = false
@@ -59,10 +62,11 @@ final class Link {
     /// Turn Wi-Fi play on or off while running: restarts the listener (a USB session stays connected).
     func setWiFi(_ on: Bool) { q.async { [self] in guard on != wifi else { return }; wifi = on; listener?.cancel(); listen() } }
     private func listen() {
-        let tcp = NWProtocolTCP.Options(); tcp.noDelay = true
+        let tcp = NWProtocolTCP.Options(); tcp.noDelay = true; tcp.disableAckStretching = true   // prompt ACKs: lower latency for tracking/video
         probe?.cancel(); probe = nil
         do {
             let params = NWParameters(tls: nil, tcp: tcp)
+            params.serviceClass = .interactiveVideo
             if wifi { answerProbes(); listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!) }   // every interface
             else {   // USB only
                 params.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!)
@@ -144,13 +148,13 @@ if Link.isLoopback(host) { promote(c); return }
             onDisconnect()
         }
         connected = false
-        conn = c; inFlight = 0
+        conn = c; resetSends()
         if case .hostPort(let h, _) = c.endpoint { peer = "\(h)" }
         c.stateUpdateHandler = { [weak self, weak c] s in
             guard let self, let c, c === self.conn else { return }
             switch s {
             case .ready: self.connected = true; self.onIssue("")
-            case .failed, .cancelled: self.connected = false; self.conn = nil; self.inFlight = 0; self.peer = ""; self.onDisconnect()
+            case .failed, .cancelled: self.connected = false; self.conn = nil; self.resetSends(); self.peer = ""; self.onDisconnect()
             default: break
             }
         }
@@ -199,22 +203,47 @@ if Link.isLoopback(host) { promote(c); return }
         }
     }
 
-    /// Frames queued but not yet handed to the kernel; used to drop frames instead of building latency.
+    /// Packets queued but not yet handed to the kernel; used to limit video latency.
     var backlog: Int { q.sync { inFlight } }
+    /// Count 10 ms PCM chunks separately: a few large video sends must not discard audio.
+    /// Keep these included in total backlog so congestion slows video submissions first.
+    var audioBacklog: Int { q.sync { audioInFlight } }
 
     func send(_ type: Int32, _ payload: Data) {
         var d = Data([UInt8(type)])
         withUnsafeBytes(of: UInt32(payload.count).littleEndian) { d.append(contentsOf: $0) }
         d.append(payload)
         q.async { [self] in
-            guard let c = conn else { return }
+            guard conn != nil else { return }
             inFlight += 1
-            c.send(content: d, completion: .contentProcessed { [weak self, weak c] error in
-                guard let self, let c, c === self.conn else { return }
-                self.inFlight = max(0, self.inFlight - 1)
-                if error != nil { c.cancel() }
-            })
+            if type == VR4_AUDIO { audioInFlight += 1; audioPackets.append(d) }
+            else { otherPackets.append(d) }
+            drainSends()
         }
+    }
+
+    private func resetSends() {
+        inFlight = 0; audioInFlight = 0; sending = false
+        audioPackets.removeAll(); otherPackets.removeAll()
+    }
+
+    /// Submit one complete wire packet at a time. When the socket is congested,
+    /// newly captured audio can precede waiting video instead of sitting behind it.
+    /// Video/config order is preserved and encoded frames are never discarded here.
+    private func drainSends() {
+        guard !sending, let c = conn else { return }
+        let isAudio = !audioPackets.isEmpty
+        guard isAudio || !otherPackets.isEmpty else { return }
+        let packet = isAudio ? audioPackets.removeFirst() : otherPackets.removeFirst()
+        sending = true
+        c.send(content: packet, completion: .contentProcessed { [weak self, weak c] error in
+            guard let self, let c, c === self.conn else { return }
+            self.inFlight = max(0, self.inFlight - 1)
+            if isAudio { self.audioInFlight = max(0, self.audioInFlight - 1) }
+            if error != nil { c.cancel(); return }
+            self.sending = false
+            self.drainSends()
+        })
     }
 
     func sendJSON(_ type: Int32, _ obj: [String: Any]) { send(type, (try? JSONSerialization.data(withJSONObject: obj)) ?? Data()) }

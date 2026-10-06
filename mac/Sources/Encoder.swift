@@ -3,6 +3,28 @@ import VideoToolbox
 
 /// Low-latency hardware H.264 encoder. Emits Annex-B with SPS/PPS in front of every IDR.
 final class Encoder {
+    // VideoToolbox's HEVC encoder rejects MaxFrameDelayCount on this Mac. Bound
+    // submitted work ourselves so overload drops a new frame instead of aging poses.
+    private final class Slots {
+        let semaphore = DispatchSemaphore(value: 3)
+        let lock = NSLock()
+        var skipped = 0
+        func acquire() -> Bool {
+            if semaphore.wait(timeout: .now()) == .success { return true }
+            lock.lock(); skipped += 1; lock.unlock(); return false
+        }
+        func takeSkipped() -> Int {
+            lock.lock(); defer { skipped = 0; lock.unlock() }; return skipped
+        }
+    }
+    private var slots = Slots()
+    private var inputPool: CVPixelBufferPool?
+    private var transfer: VTPixelTransferSession?
+    func takeBackpressureSkips() -> Int { slots.takeSkipped() }
+    func setExpectedFrameRate(_ fps: Int) {
+        guard let session else { return }
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: fps as CFTypeRef)
+    }
     private var session: VTCompressionSession?
     private(set) var width = 0, height = 0
     private(set) var hevc = false
@@ -21,8 +43,19 @@ final class Encoder {
     /// Returns false if VideoToolbox could not create the session (the caller falls back, e.g. HEVC -> H.264).
     @discardableResult func configure(width w: Int, height h: Int, fps: Int, mbps: Int, maxQP: Int, hevc useHEVC: Bool = false) -> Bool {
         if let s = session { VTCompressionSessionInvalidate(s); session = nil }
+        slots = Slots()   // late callbacks release their old session's slots
         width = w; height = h; forceIDR = true; hevc = useHEVC; generation += 1; loggedError = false
-        let spec = [kVTVideoEncoderSpecification_EnableLowLatencyRateControl: true] as CFDictionary
+        inputPool = nil
+        if useHEVC {
+            let attrs: [CFString: Any] = [kCVPixelBufferWidthKey: w, kCVPixelBufferHeightKey: h,
+                kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                kCVPixelBufferIOSurfacePropertiesKey: [:]]
+            CVPixelBufferPoolCreate(nil, nil, attrs as CFDictionary, &inputPool)
+            if transfer == nil { VTPixelTransferSessionCreate(allocator: nil, pixelTransferSessionOut: &transfer) }
+        }
+        // Low-latency rate control was slower in local HEVC tests; hardware
+        // reporting was unavailable in that mode, so do not infer software use.
+        let spec = [kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true] as CFDictionary
         let created = VTCompressionSessionCreate(allocator: nil, width: Int32(w), height: Int32(h), codecType: useHEVC ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264,
                                    encoderSpecification: spec, imageBufferAttributes: nil, compressedDataAllocator: nil,
                                    outputCallback: nil, refcon: nil, compressionSessionOut: &session)
@@ -36,7 +69,6 @@ final class Encoder {
             kVTCompressionPropertyKey_AverageBitRate: mbps * 1_000_000,
             kVTCompressionPropertyKey_ExpectedFrameRate: fps,
             kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration: 10,
-            kVTCompressionPropertyKey_MaxFrameDelayCount: 0,
             // explicit Rec.709 so the headset decoder doesn't guess the colour range/matrix (washed-out colours)
             kVTCompressionPropertyKey_ColorPrimaries: kCVImageBufferColorPrimaries_ITU_R_709_2,
             kVTCompressionPropertyKey_TransferFunction: kCVImageBufferTransferFunction_ITU_R_709_2,
@@ -45,11 +77,15 @@ final class Encoder {
             // cap bursts (IDRs) at 2x the average over a quarter second so frames don't queue behind them
             kVTCompressionPropertyKey_DataRateLimits: [mbps * 1_000_000 / 8 / 2, 0.25] as CFArray,
         ]
-        for (k, v) in props { VTSessionSetProperty(s, key: k, value: v as CFTypeRef) }
+        for (k, v) in props {
+            let result = VTSessionSetProperty(s, key: k, value: v as CFTypeRef)
+            if result != noErr { NSLog("VR4Mac: encoder property %@ rejected (%d)", k as String, result) }
+        }
         // low-latency rate control undershoots badly on simple scenes; a QP ceiling keeps text/edges sharp. Too low a ceiling
         // makes VT *drop* detailed frames it can't fit under DataRateLimits (BONELAB lost ~8%), so it only guards quality.
         let st = VTSessionSetProperty(s, key: kVTCompressionPropertyKey_MaxAllowedFrameQP, value: maxQP as CFTypeRef)
-        NSLog("VR4Mac: %@ encoder %dx%d @ %d fps, %d Mbps, max QP %d (%@)", useHEVC ? "HEVC" : "H.264", w, h, fps, mbps, maxQP, st == noErr ? "ok" : "unsupported \(st)")
+        var hw: CFBoolean?; VTSessionCopyProperty(s, key: kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, allocator: nil, valueOut: &hw)
+        NSLog("VR4Mac: %@ encoder %dx%d @ %d fps, %d Mbps, max QP %d (%@), hardware %@", useHEVC ? "HEVC" : "H.264", w, h, fps, mbps, maxQP, st == noErr ? "ok" : "unsupported \(st)", hw == kCFBooleanTrue ? "yes" : "no")
         VTCompressionSessionPrepareToEncodeFrames(s)
         return true
     }
@@ -61,8 +97,10 @@ final class Encoder {
         VTSessionSetProperty(s, key: kVTCompressionPropertyKey_DataRateLimits, value: [mbps * 1_000_000 / 8 / 2, 0.25] as CFArray)
     }
 
-    func encode(_ pb: CVPixelBuffer, timeNs: UInt64) {
-        guard let s = session else { return }
+    @discardableResult func encode(_ pb: CVPixelBuffer, timeNs: UInt64) -> Bool {
+        guard let s = session else { return false }
+        let slots = self.slots
+        guard slots.acquire() else { return false }
         CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, .shouldPropagate)
         CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, .shouldPropagate)
         CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, .shouldPropagate)
@@ -73,9 +111,18 @@ final class Encoder {
         // it had 1000 fps, so slow games (BONELAB ~33 fps) got a tiny per-frame budget and frames were dropped.
         let hevc = self.hevc, gen = generation
         let t0 = DispatchTime.now().uptimeNanoseconds
+        // Feed the hardware's native 4:2:0 format instead of making every
+        // compression submission perform its own BGRA conversion.
+        var input = pb, converted: CVPixelBuffer?
+        if let inputPool, let transfer,
+           CVPixelBufferPoolCreatePixelBuffer(nil, inputPool, &converted) == kCVReturnSuccess,
+           let converted, VTPixelTransferSessionTransferImage(transfer, from: pb, to: converted) == noErr {
+            input = converted
+        }
         let pts = CMTime(value: CMTimeValue(t0 / 1000), timescale: 1_000_000)
-        VTCompressionSessionEncodeFrame(s, imageBuffer: pb, presentationTimeStamp: pts,
+        let result = VTCompressionSessionEncodeFrame(s, imageBuffer: input, presentationTimeStamp: pts,
                                         duration: .invalid, frameProperties: opts, infoFlagsOut: nil) { [weak self] status, _, sb in
+            defer { slots.semaphore.signal() }
             guard status == noErr, let sb, let self, self.generation == gen else {
                 if status != noErr, self?.loggedError == false { self?.loggedError = true; NSLog("VR4Mac: encode failed %d", status) }
                 return
@@ -84,6 +131,12 @@ final class Encoder {
             let (data, idr) = Encoder.annexB(sb, hevc: hevc)
             self.onFrame(data, idr, timeNs)
         }
+        if result != noErr {
+            slots.semaphore.signal()
+            if !loggedError { loggedError = true; NSLog("VR4Mac: encode submission failed %d", result) }
+            return false
+        }
+        return true
     }
 
     static func annexB(_ sb: CMSampleBuffer, hevc: Bool = false) -> (Data, Bool) {

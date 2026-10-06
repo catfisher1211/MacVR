@@ -228,7 +228,7 @@ final class Engine: ObservableObject {
         audio.onChunk = { [weak self] pkt in
             self?.rq.async {
                 guard let self, self.audioEnabled else { return }
-                guard self.link.backlog < 4 else { self.audioStat.dropped += 1; return }
+                guard self.link.audioBacklog < 10 else { self.audioStat.dropped += 1; return }
                 var out = Engine.mix(pkt)
                 self.mixUI(into: &out); self.lastAudioChunk = Date()
                 self.audioStat.packets += 1
@@ -299,6 +299,9 @@ final class Engine: ObservableObject {
     // Auto bitrate (rq): frames backing up on the link or dropped by the headset lower the encoder's rate; clean seconds
     // bring it back up to the ceiling.
     private var autoMbps = 0, linkSkips = 0, cleanSince = CACurrentMediaTime(), lastAdapt = CACurrentMediaTime()
+    /// Best recent headset frame age (ms), creeping up 0.5 ms/s. On Wi-Fi a stall queues frames in the TCP send buffer
+    /// where `link.backlog` can't see them and the headset drops nothing; only the frame age grows.
+    private var latencyFloor = Double.infinity
     static func adaptBitrate(_ cur: Int, ceiling: Int, congested: Bool, cleanFor: Double) -> Int {
         if congested { return max(15, cur * 4 / 5) }                       // back off 20% (not below 15 Mbps)
         return cleanFor >= 8 ? min(ceiling, cur + max(2, cur / 10)) : cur   // after 8 s clean: +10% per second
@@ -306,9 +309,14 @@ final class Engine: ObservableObject {
     private func adaptBitrate() {
         lastAdapt = CACurrentMediaTime()
         defer { linkSkips = 0 }
-        guard settings["bitrate"] == "Auto", eyeW > 0, link.connected else { autoMbps = mbps; return }
+        guard settings["bitrate"] == "Auto" || !link.wired, eyeW > 0, link.connected else { autoMbps = mbps; return }
         if autoMbps == 0 { autoMbps = mbps }
-        let congested = linkSkips > 1 || (headsetStatus["dropped"] as? Int ?? 0) > 2
+        var lagging = false
+        if let lat = headsetStatus["latency_ms"] as? Double, lat > 0 {
+            latencyFloor = min(latencyFloor + 0.5, lat)
+            lagging = lat > latencyFloor + 40
+        }
+        let congested = linkSkips > 1 || (headsetStatus["dropped"] as? Int ?? 0) > 2 || lagging
         if congested { cleanSince = CACurrentMediaTime() }
         let next = Engine.adaptBitrate(autoMbps, ceiling: mbps, congested: congested, cleanFor: CACurrentMediaTime() - cleanSince)
         if next != autoMbps { NSLog("VR4Mac: auto bitrate %d -> %d Mbps", autoMbps, next); autoMbps = next; encoder.setBitrate(next) }
@@ -442,11 +450,12 @@ final class Engine: ObservableObject {
         comp.reduceMotion = settings.bool("reduce_motion")
         comp.setTheaterStyle(Compositor.theaterStyle(screen: settings["theater_screen"], curved: settings.bool("theater_curved"), lights: settings["theater_lights"]))
         comp.setGrid(settings.bool("floor_grid"))
-        if eyeW > 0 { encoder.configure(width: eyeW * 2, height: eyeH, fps: fps, mbps: mbps, maxQP: (link.wired ? 23 : 30) + (useHEVC ? 4 : 0), hevc: useHEVC); autoMbps = mbps }
+        if eyeW > 0 { encoder.configure(width: eyeW * 2, height: eyeH, fps: fps, mbps: mbps, maxQP: link.wired ? (useHEVC ? 18 : 23) : (useHEVC ? 34 : 30), hevc: useHEVC); autoMbps = mbps }
         requestDraw()
     }
 
     private var config: [String: Any] = [:], helloMic = false
+    private let trackingCadence = TrackingCadence()
     /// CONFIG, also re-sent (same video params) when the microphone choice changes, to start/stop headset capture.
     private func sendConfig() {
         guard !config.isEmpty else { return }
@@ -456,24 +465,31 @@ final class Engine: ObservableObject {
     }
 
     private func hello(_ j: [String: Any]) {
+        trackingCadence.reset()
         let scale = Double(settings.int("render_scale")) / 100
         let rw = (j["eye_w"] as? Int).map { max(256, min(4096, $0)) } ?? 1440, rh = (j["eye_h"] as? Int).map { max(256, min(4096, $0)) } ?? 1584
         eyeW = max(128, min(2048, Int(Double(rw) * scale) / 32 * 32)); eyeH = max(128, min(2048, Int(Double(rh) * scale) / 32 * 32))
+        latencyFloor = .infinity
+        if !link.wired && eyeW > 1664 {   // ~40 Mbps can't feed 2048x2048 per eye at 90 Hz; a smaller, cleaner picture looks sharper
+            eyeH = eyeH * 1664 / eyeW / 32 * 32; eyeW = 1664
+        }
         floorOffset = j["reference_space"] as? String == "local" ? 1.6 : 0   // client has no STAGE space: assume standing height
         let rates = (j["refresh_rates"] as? [Double])?.map { Int($0.rounded()) } ?? [72]
+        NSLog("VR4Mac: HELLO eye %dx%d, refresh %@, codecs %@, hevc max %@x%@", rw, rh, "\(rates)", (j["codecs"] as? [String])?.joined(separator: ",") ?? "none", "\(j["hevc_max_eye_w"] ?? "-")", "\(j["hevc_max_eye_h"] ?? "-")")
         fps = rates.contains(settings.int("refresh_rate")) ? settings.int("refresh_rate") : (rates.first ?? 72)
         useHEVC = settings["codec"] == "HEVC" && (j["codecs"] as? [String])?.contains("hevc") == true
         if useHEVC, let mw = j["hevc_max_eye_w"] as? Int, let mh = j["hevc_max_eye_h"] as? Int, mw > 0, mh > 0 {
             eyeW = min(eyeW, mw / 32 * 32); eyeH = min(eyeH, mh / 32 * 32)
         }
-        // decoder budget: H.264 level 5.1 = 983040 macroblocks/s; Quest HEVC ~4K60 (~480M px/s). Above it frames get rejected.
-        let maxPixelsPerSecond = useHEVC ? 480_000_000 : 983_040 * 256
+        // Preserve older headsets' decoder budget; the higher HEVC budget was tested only on Quest 3.
+        let quest3 = (j["device"] as? String) == "Quest 3"
+        let maxPixelsPerSecond = useHEVC ? (quest3 ? 1_050_000_000 : 480_000_000) : 983_040 * 256
         while eyeW * 2 * eyeH * fps > maxPixelsPerSecond && eyeW > 256 {
             eyeW = (eyeW * 15 / 16) / 32 * 32; eyeH = (eyeH * 15 / 16) / 32 * 32
         }
         helloMic = j["mic"] as? Bool == true
         // encoder first: CONFIG must name a codec that actually started (HEVC falls back to H.264), or the headset waits on a black stream
-        if !encoder.configure(width: eyeW * 2, height: eyeH, fps: fps, mbps: mbps, maxQP: (link.wired ? 23 : 30) + (useHEVC ? 4 : 0), hevc: useHEVC), useHEVC {
+        if !encoder.configure(width: eyeW * 2, height: eyeH, fps: fps, mbps: mbps, maxQP: link.wired ? (useHEVC ? 18 : 23) : (useHEVC ? 34 : 30), hevc: useHEVC), useHEVC {
             useHEVC = false
             encoder.configure(width: eyeW * 2, height: eyeH, fps: fps, mbps: mbps, maxQP: link.wired ? 23 : 30, hevc: false)
         }
@@ -502,7 +518,7 @@ final class Engine: ObservableObject {
             t.setEventHandler { [weak self] in
                 guard let self, self.audioEnabled, Date().timeIntervalSince(self.lastAudioChunk) > 0.03 else { return }
                 self.pullUISounds()
-                guard !self.uiQueue.isEmpty || UISounds.shared.musicPlaying, self.link.backlog < 4 else { return }
+                guard !self.uiQueue.isEmpty || UISounds.shared.musicPlaying, self.link.audioBacklog < 10 else { return }
                 var t = UInt64(DispatchTime.now().uptimeNanoseconds)
                 var pkt = Data(bytes: &t, count: 8); pkt.append(Data(count: 1920))
                 self.mixUI(into: &pkt); self.audioStat.packets += 1
@@ -516,6 +532,17 @@ final class Engine: ObservableObject {
 
     /// Called on the link queue for every TRACKING packet; coalesces onto the render queue.
     private func tracking(_ raw: VR4Tracking, joints raw2: [[VR4Pose]?] = [nil, nil]) {
+        if let measured = trackingCadence.observe(raw.time_ns) {
+            rq.async { [self] in
+                guard measured != fps, eyeW > 0 else { return }
+                NSLog("VR4Mac: tracking cadence %d Hz; correcting startup pacing %d Hz", measured, fps)
+                fps = measured; shm.p.pointee.fps = Float(measured)
+                encoder.setExpectedFrameRate(measured)
+                let info = "\(eyeW * 2)x\(eyeH) @ \(measured) Hz (tracking)"
+                dq.async { [self] in dash.streamInfo = info; requestDraw() }
+                DispatchQueue.main.async { self.streamInfo = (self.link.wired ? "USB" : "Wi-Fi") + " · " + info }
+            }
+        }
         var t = raw, joints = raw2
         if !settings.bool("hand_tracking") {
             joints = [nil, nil]
@@ -721,7 +748,6 @@ final class Engine: ObservableObject {
         perf.frames += 1
         if CACurrentMediaTime() - perf.t >= 1 { updateHUD() }
         comp.stamp(pb, eyes: eyes, fovs: fovs, overlays())
-        stat.encIn += 1
         if Date().timeIntervalSince(stat.t) >= 5 {
             let d = Date().timeIntervalSince(stat.t)
             NSLog("VR4Mac: pipeline %.1f game fps, %.1f to encoder, %.1f encoded, %d backlog skips; audio %d pkts (%d dropped, peak %d, enabled %d)", Double(stat.game) / d, Double(stat.encIn) / d, Double(stat.encoded) / d, stat.backlogSkip, audioStat.packets, audioStat.dropped, Int(audioStat.peak), audioEnabled ? 1 : 0)
@@ -729,7 +755,7 @@ final class Engine: ObservableObject {
             stat = (0, 0, 0, 0, Date())
         }
         setViewFrame(pb)
-        encoder.encode(pb, timeNs: timeNs)
+        if encoder.encode(pb, timeNs: timeNs) { stat.encIn += 1 }
         fpsCount += 1
         if Date().timeIntervalSince(fpsT) >= 1 { let n = fpsCount; dq.async { self.dash.fps = n }; fpsCount = 0; fpsT = Date() }
     }
@@ -795,6 +821,7 @@ final class Engine: ObservableObject {
     }
 
     // MARK: system overlays (rq): performance HUD, toasts and the recording light, stamped onto every frame (games too)
+    private var perfLogs = 0, loggedSkips = 0
     private var perf = (frames: 0, renderNs: UInt64(0), renders: 0, videoBytes: 0, t: CACurrentMediaTime())
     private var headsetStatus: [String: Any] = [:], lowBatteryWarned = false
     private var hudPanel: CGContext?, toastPanel: (CGContext, CFTimeInterval)?, toastThumb: CGImage?
@@ -819,6 +846,12 @@ final class Engine: ObservableObject {
         let d = max(0.001, CACurrentMediaTime() - perf.t), p = perf
         perf = (0, 0, 0, 0, CACurrentMediaTime())
         let enc = encoder.takeEncodeMs()
+        let encoderSkips = encoder.takeBackpressureSkips()
+        perfLogs += 1; loggedSkips += encoderSkips
+        if perfLogs % 5 == 0 {   // every 5 s, alongside the pipeline counters
+            NSLog("VR4Mac: perf %.1f fps, render %.1f ms, encode %.1f ms, latency %@, encoder skips %d in 5 s", Double(p.frames) / d, p.renders > 0 ? Double(p.renderNs) / Double(p.renders) / 1e6 : -1.0, enc ?? -1.0, "\(headsetStatus["latency_ms"] ?? "-")", loggedSkips)
+            loggedSkips = 0
+        }
         guard settings.bool("perf_hud") else { hudPanel = nil; return }
         var top = String(format: "%.0f fps", Double(p.frames) / d)
         if p.renders > 0 { top += String(format: "   render %.1f ms", Double(p.renderNs) / Double(p.renders) / 1e6) }

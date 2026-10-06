@@ -47,12 +47,42 @@ import Darwin
         wait(status, "STATUS parsed")
         for _ in 0..<160 { link.send(Int32(VR4_VIDEO), Data(count: 65536)) }
         precondition(link.backlog > 0, "Must exercise pending sends")
+        precondition(link.audioBacklog == 0, "Video congestion must not consume the audio allowance")
+        for _ in 0..<12 { link.send(Int32(VR4_AUDIO), Data(count: 1928)) }
+        precondition(link.audioBacklog > 0, "Must exercise pending audio behind congested video")
+        // Read real wire packets from the previously stalled receiver. Audio must
+        // jump ahead of waiting video without corrupting either packet's framing.
+        var timeout = timeval(tv_sec: 5, tv_usec: 0)
+        setsockopt(first, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        func readExactly(_ count: Int) -> [UInt8] {
+            var bytes = [UInt8](repeating: 0, count: count), offset = 0
+            while offset < count {
+                let n = bytes.withUnsafeMutableBytes { Darwin.read(first, $0.baseAddress!.advanced(by: offset), count - offset) }
+                precondition(n > 0, "Timed out or truncated wire packet")
+                offset += n
+            }
+            return bytes
+        }
+        var precedingVideo = 0
+        while true {
+            let h = readExactly(5)
+            let length = h.withUnsafeBytes { Int($0.loadUnaligned(fromByteOffset: 1, as: UInt32.self).littleEndian) }
+            precondition(length == (h[0] == VR4_AUDIO ? 1928 : 65536), "Intact packet boundary")
+            _ = readExactly(length)
+            if h[0] == VR4_AUDIO { break }
+            precondition(h[0] == VR4_VIDEO, "Expected audio/video")
+            precedingVideo += 1
+            precondition(precedingVideo < 160, "Audio must precede queued video under congestion")
+        }
+        print("PASS: audio priority over stalled video with intact wire framing (\(precedingVideo) video packets already submitted)")
         let second = client(port); wait(disconnected, "replacement cleanup"); wait(hello, "replacement HELLO")
         close(first)
         Thread.sleep(forTimeInterval: 0.2)
         precondition(link.backlog == 0, "Old completions must not corrupt new connection backlog")
+        precondition(link.audioBacklog == 0, "Replacement must reset audio accounting")
         close(second); wait(disconnected, "EOF cleanup")
         precondition(link.backlog == 0, "Disconnected backlog must reset")
+        precondition(link.audioBacklog == 0, "Disconnected audio backlog must reset")
         let other = Link(port: port)
         other.onIssue = { if !$0.isEmpty { conflict.signal() } }
         other.start(discovery: false)

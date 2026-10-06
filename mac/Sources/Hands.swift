@@ -519,7 +519,10 @@ final class HandModel {
                                                         componentsPerVector: 4, bytesPerComponent: 4, dataOffset: 0, dataStride: 16)],
                             elements: [showArms ? (showTorso ? torsoElement : element) : handElement])
         g.materials = [material]
-        g.subdivisionLevel = HandModel.smooth   // rounds the low-poly fingertips and palm creases
+        // The mesh changes with each pose, so subdivision rebuilds its topology
+        // on the render thread each frame. Keep smooth vertex normals without
+        // the CPU subdivision that dominated the controller-motion profile.
+        g.subdivisionLevel = 0
         node.geometry = g
     }
 }
